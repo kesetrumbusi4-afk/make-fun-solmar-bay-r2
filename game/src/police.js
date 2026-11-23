@@ -77,7 +77,10 @@ export class Police {
     }
   }
 
-  draw(ctx) {
-    for (const car of this.cars) car.draw(ctx);
+  draw(ctx, v) {
+    for (const car of this.cars) {
+      if (v && (car.x < v.x0 - 30 || car.x > v.x1 + 30 || car.y < v.y0 - 30 || car.y > v.y1 + 30)) continue;
+      car.draw(ctx);
+    }
   }
 }

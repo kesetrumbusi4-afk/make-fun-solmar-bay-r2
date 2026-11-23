@@ -3,8 +3,9 @@
 // pick things up, deliver, or survive. Stages complete by proximity or by
 // holding position; the manager pays the reward and unlocks the next one.
 
-import { MISSION_REWARDS } from './config.js';
+import { MISSION_REWARDS, PERF } from './config.js';
 import { Car } from './car.js';
+import { saveCheckpoint, applyCheckpoint } from './save.js';
 
 function stage(type, x, y, opts = {}) {
   return { type, x, y, radius: opts.radius ?? 56, seconds: opts.seconds ?? 0, text: opts.text ?? '', done: false, timer: 0 };
@@ -117,6 +118,8 @@ export class MissionManager {
     this.unlocked = Math.max(1, Math.min(8, (this.completed.size || 0) + 1));
     this.message = '';
     this.messageTimer = 0;
+    this._stageTime = 0;
+    this._stuckHint = false;
   }
 
   get currentStage() {
@@ -130,8 +133,10 @@ export class MissionManager {
     this.active = def;
     this.stageIdx = 0;
     this.stageTimer = 0;
+    this._stageTime = 0;
+    this._stuckHint = false;
     this.enemies = [];
-    this.message = `Mission: ${def.title}`;
+    this.message = `Mission: ${def.title} — checkpoint saved`;
     this.messageTimer = 3;
     const g = this.game;
     // Mission-specific setups.
@@ -156,6 +161,9 @@ export class MissionManager {
       this._spawnGuards(car.x, car.y, 2);
     }
     if (g.audio) g.audio.pickup();
+    // Checkpoint at mission start: a failure or a closed tab resumes here,
+    // never from the beginning of the game.
+    saveCheckpoint(g);
     return true;
   }
 
@@ -205,6 +213,27 @@ export class MissionManager {
     if (st.type === 'goto' || st.type === 'pickup' || st.type === 'steal') {
       if (d < st.radius) {
         if (st.type === 'steal') {
+          if (!this.targetCar || this.targetCar.dead) {
+            // Target wrecked or gone: park a fresh one at the marker so the
+            // mission can always be finished — no soft-lock.
+            const car = new Car(
+              st.x + 30, st.y + 20, this.active.id === 8 ? Math.PI / 2 : 0,
+              this.active.id === 8 ? '#ffd76a' : '#e84a4a', { target: true },
+            );
+            car.parked = true;
+            g.world.parkedCars.push({ x: car.x, y: car.y, angle: car.angle, color: car.color, car });
+            this.targetCar = car;
+            this.message = 'A fresh target car is waiting at the marker';
+            this.messageTimer = 3;
+            return;
+          }
+          if (g.player.car && g.player.car !== this.targetCar) {
+            // Sitting in the wrong car: step out so the target can be taken.
+            g._exitCar();
+            this.message = 'Out of that car — take the target car';
+            this.messageTimer = 2;
+            return;
+          }
           if (this.targetCar && !g.player.car) {
             // Player must be in the target car: auto-enter when close.
             g.player.car = this.targetCar;
@@ -255,10 +284,25 @@ export class MissionManager {
     if (st.seconds > 0 && st.type === 'goto') {
       this.fareTimer += dt;
       if (this.fareTimer > st.seconds) {
-        this.message = 'Too slow — mission failed. Try again from Lena.';
-        this.messageTimer = 3;
-        this.active = null;
         this.fareTimer = 0;
+        // Fail back to the checkpoint: position, health and progress
+        // restored, so a failed mission costs seconds, not hours.
+        const restored = applyCheckpoint(g);
+        this.active = null;
+        this.message = restored
+          ? 'Too slow — mission failed. Back at the checkpoint, press M to retry.'
+          : 'Too slow — mission failed. Try again from Lena.';
+        this.messageTimer = 4;
+      }
+    }
+    // Stuck detector: a stage that makes no progress for two minutes gets
+    // an escape hatch instead of a dead end.
+    if (this.active) {
+      this._stageTime += dt;
+      if (this._stageTime > PERF.stuckHintSeconds && !this._stuckHint) {
+        this._stuckHint = true;
+        this.message = 'Stuck? Press R to restart this mission from the checkpoint';
+        this.messageTimer = 5;
       }
     }
   }
@@ -267,18 +311,22 @@ export class MissionManager {
     const g = this.game;
     this.stageIdx += 1;
     this.fareTimer = 0;
+    this._stageTime = 0;
+    this._stuckHint = false;
     if (this.stageIdx >= this.active.stages.length) {
       const def = this.active;
       g.player.cash += def.reward;
       this.completed.add(def.id);
       this.unlocked = Math.max(this.unlocked, Math.min(8, def.id + 1));
-      this.message = `Mission complete: ${def.title}  +$${def.reward}`;
+      this.message = `Mission complete: ${def.title}  +$${def.reward} — checkpoint saved`;
       this.messageTimer = 4;
       if (g.audio) g.audio.missionDone();
       if (g.saveData) {
         g.saveData.completedMissions = [...this.completed];
         g.saveData.cash = g.player.cash;
       }
+      // Checkpoint at once: progress is never more than one mission old.
+      saveCheckpoint(g);
       this.active = null;
       this.enemies = [];
       this.targetCar = null;

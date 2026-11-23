@@ -64,6 +64,9 @@ export class Fx {
   }
 
   update(dt) {
+    // Cap the live particle count so a chain of explosions cannot grow
+    // the list without bound and drag the frame rate down.
+    if (this.parts.length > 240) this.parts.splice(0, this.parts.length - 240);
     for (const p of this.parts) {
       p.x += p.vx * dt;
       p.y += p.vy * dt;

@@ -55,3 +55,8 @@ export const PACKAGE_VALUE = 100;
 export const HIDDEN_PACKAGES = 10;
 
 export const SAVE_KEY = 'solmar-bay-r2-save-v1';
+
+// Performance: adaptive quality. Frame work is measured as an EMA; when it
+// stays slow the game drops to ECO (fewer lamp halos, half-rate pedestrians)
+// and returns to full quality once frames are fast again.
+export const PERF = { ecoOnMs: 26, ecoOffMs: 15, stuckHintSeconds: 120 };

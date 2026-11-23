@@ -2,7 +2,7 @@
 // side job, hidden packages, busted/respawn, save, and the debug handle
 // the headless play-test drives (window.__solmar).
 
-import { WORLD_W, WORLD_H } from './config.js';
+import { WORLD_W, WORLD_H, PERF } from './config.js';
 import { World, nearestRoadPoint } from './world.js';
 import { Input } from './input.js';
 import { AudioSys } from './audio.js';
@@ -14,7 +14,7 @@ import { Fx } from './fx.js';
 import { Renderer } from './render.js';
 import { Minimap } from './minimap.js';
 import { applyShot } from './shots.js';
-import { loadSave, writeSave } from './save.js';
+import { loadSave, writeSave, saveCheckpoint, applyCheckpoint } from './save.js';
 import { Car } from './car.js';
 
 export class Game {
@@ -36,6 +36,37 @@ export class Game {
       this.missions.completed = new Set(this.saveData.completedMissions);
       this.missions.unlocked = Math.max(1, Math.min(8, this.missions.completed.size + 1));
     }
+    // Restore found packages (by id on new saves, by count on old ones).
+    if (Array.isArray(this.saveData.packageIds)) {
+      const ids = new Set(this.saveData.packageIds);
+      for (const pkg of this.world.packages) if (ids.has(pkg.id)) pkg.taken = true;
+      this.world.packagesTaken = this.world.packages.filter((k) => k.taken).length;
+    } else {
+      this.world.packagesTaken = this.saveData.packages ?? 0;
+      let n = this.world.packagesTaken;
+      for (const pkg of this.world.packages) {
+        if (n <= 0) break;
+        pkg.taken = true;
+        n--;
+      }
+    }
+    // Restore the checkpoint, if one was saved: position, health, ammo.
+    this._restoredCheckpoint = null;
+    if (this.saveData.checkpoint) {
+      const cp = this.saveData.checkpoint;
+      this.player.x = cp.x ?? this.player.x;
+      this.player.y = cp.y ?? this.player.y;
+      this.player.hp = Math.max(50, cp.hp ?? 100);
+      this.player.ammo = Math.max(12, cp.ammo ?? 48);
+      this._restoredCheckpoint = cp;
+    } else {
+      // Fast opening: Jax starts in his own car outside Lena's Bar, so the
+      // game opens on a drive, not a walk across the city.
+      const starter = new Car(this.world.lenasBar.x + 70, this.world.lenasBar.y + 40, 0, '#e84a4a', {});
+      this.player.car = starter;
+      this.player.x = starter.x;
+      this.player.y = starter.y;
+    }
     this.state = 'title'; // title | playing | busted
     this.frozen = false;
     this.time = 0;
@@ -44,6 +75,8 @@ export class Game {
     this.bustedTimer = 0;
     this._lastTs = 0;
     this._saveTimer = 0;
+    // Frame-time monitor: EMA of update+draw work; drives ECO mode.
+    this.perf = { ema: 16.7, eco: false, frames: 0 };
     this.shot = new URLSearchParams(window.location.search).get('shot');
   }
 
@@ -55,6 +88,7 @@ export class Game {
       applyShot(this.shot, this);
     }
     const loop = (ts) => {
+      const t0 = performance.now();
       const dt = Math.min(0.05, (ts - this._lastTs) / 1000 || 0.016);
       this._lastTs = ts;
       if (!this.frozen) this.update(dt);
@@ -65,6 +99,17 @@ export class Game {
       if (this.state === 'busted') this._drawBusted(this.renderer.ctx);
       this.input.endFrame();
       requestAnimationFrame(loop);
+      // Frame-time monitor: sustained slow frames switch to ECO mode.
+      const ms = performance.now() - t0;
+      this.perf.ema = this.perf.ema * 0.95 + ms * 0.05;
+      this.perf.frames++;
+      if (!this.perf.eco && this.perf.ema > PERF.ecoOnMs && this.perf.frames > 90) {
+        this.perf.eco = true;
+        this.missions.message = 'Performance mode: ECO — fewer effects, same game';
+        this.missions.messageTimer = 3;
+      } else if (this.perf.eco && this.perf.ema < PERF.ecoOffMs) {
+        this.perf.eco = false;
+      }
     };
     requestAnimationFrame(loop);
   }
@@ -99,6 +144,14 @@ export class Game {
         this.state = 'playing';
         this.audio.ensure();
         this.audio.startMusic();
+        // Fast opening: a fresh save jumps straight into Mission 1, so the
+        // first minute is a drive with an objective, not a walk to find one.
+        if (this.missions.completed.size === 0 && !this.missions.active) {
+          this.missions.start(1);
+        } else if (this._restoredCheckpoint) {
+          this.missions.message = `Checkpoint restored — Mission ${this.missions.unlocked} ready at Lena's Bar`;
+          this.missions.messageTimer = 4;
+        }
       }
       return;
     }
@@ -111,6 +164,18 @@ export class Game {
     if (inp.mouse.clicked || inp.pressed('KeyW')) {
       this.audio.ensure();
       this.audio.startMusic();
+    }
+    // Manual checkpoint (C) and mission retry from the checkpoint (R).
+    if (inp.pressed('KeyC')) {
+      saveCheckpoint(this);
+      this.missions.message = 'Checkpoint saved';
+      this.missions.messageTimer = 2;
+      this.audio.pickup();
+    }
+    if (inp.pressed('KeyR') && this.missions.active) {
+      applyCheckpoint(this);
+      this.missions.message = 'Mission restarted from the checkpoint';
+      this.missions.messageTimer = 3;
     }
     // Mission start near Lena's bar.
     const L = this.world.lenasBar;
@@ -154,13 +219,16 @@ export class Game {
       if (Math.hypot(p.x - pkg.x, p.y - pkg.y) < 30) {
         pkg.taken = true;
         p.cash += 100;
-        this.saveData.packages = (this.saveData.packages ?? 0) + 1;
-        this.missions.message = `Hidden package found! +$100 (${this.saveData.packages}/10)`;
+        this.world.packagesTaken += 1;
+        this.saveData.packages = this.world.packagesTaken;
+        if (!Array.isArray(this.saveData.packageIds)) this.saveData.packageIds = [];
+        this.saveData.packageIds.push(pkg.id);
+        this.missions.message = `Hidden package found! +$100 (${this.world.packagesTaken}/10)`;
         this.missions.messageTimer = 3;
         this.audio.pickup();
       }
     }
-    this.traffic.update(dt, this.world, p, this.fx);
+    this.traffic.update(dt, this.world, p, this.fx, this.perf.eco);
     this.police.update(dt, p, this.fx, this.audio);
     this.missions.update(dt);
     this.fx.update(dt);
@@ -177,6 +245,8 @@ export class Game {
       this._saveTimer = 0;
       this.saveData.cash = p.cash;
       this.saveData.completedMissions = [...this.missions.completed];
+      this.saveData.packages = this.world.packagesTaken;
+      this.saveData.packageIds = this.world.packages.filter((k) => k.taken).map((k) => k.id);
       writeSave(this.saveData);
     }
   }
@@ -190,6 +260,7 @@ export class Game {
     for (const pc of this.world.parkedCars) if (pc.car) candidates.push(pc.car);
     else if (!pc.car) candidates.push(pc);
     for (const c of candidates) {
+      if (c.dead) continue; // a wrecked car cannot be driven
       const cx = c.x ?? 0;
       const cy = c.y ?? 0;
       const d = Math.hypot(p.x - cx, p.y - cy);
@@ -377,10 +448,10 @@ export class Game {
     ctx.fillText('An open-world crime game — walk, drive, steal, outrun the law', vw / 2, vh / 2 - 30);
     ctx.fillStyle = '#c9b8e8';
     ctx.font = '15px system-ui, sans-serif';
-    ctx.fillText('WASD drive & walk · E enter/exit car · Mouse aim, Click shoot · M mission at Lena\'s Bar · T taxi fare', vw / 2, vh / 2 + 8);
+    ctx.fillText('WASD move · E enter/exit car · Click shoot · M mission · T taxi · C checkpoint · R retry', vw / 2, vh / 2 + 8);
     ctx.fillStyle = '#7ae0a3';
     ctx.font = 'bold 18px system-ui, sans-serif';
-    ctx.fillText('Press ENTER to start', vw / 2, vh / 2 + 52);
+    ctx.fillText('Press ENTER to start — Mission 1 begins right away', vw / 2, vh / 2 + 52);
     ctx.textAlign = 'left';
   }
 
@@ -422,7 +493,14 @@ window.__solmar = {
       stage: game.missions.stageIdx,
       completed: [...game.missions.completed],
       packages: game.world.packages.filter((k) => k.taken).length,
+      fps: Math.round(1000 / Math.max(1, game.perf.ema)),
+      eco: game.perf.eco,
+      checkpoint: game.saveData.checkpoint ? game.saveData.checkpoint.nextMission : null,
+      nextMission: game.missions.unlocked,
     };
+  },
+  checkpoint() {
+    return game.saveData.checkpoint || null;
   },
   startMission(id) {
     return game.missions.start(id);

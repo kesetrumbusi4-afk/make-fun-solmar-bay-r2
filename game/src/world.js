@@ -45,6 +45,7 @@ export class World {
     this.trees = [];
     this.parkedCars = [];
     this.packages = [];
+    this.packagesTaken = 0;
     this.streetLamps = [];
 
     // Buildings: one or two per block between roads.
@@ -143,6 +144,26 @@ export class World {
     this.workshop = { x: roadCenter(6), y: roadCenter(2), label: 'Rico Workshop' };
     this.docks = { x: this.sandX + 60, y: roadCenter(4), label: 'Docks' };
     this.hospital = { x: roadCenter(3), y: roadCenter(6), label: 'Hospital' };
+
+    // Spatial index for building collision: 320-unit cells, built once
+    // (buildings never move), so a collision test only checks the few
+    // buildings near the circle instead of every building in the city.
+    this._grid = new Map();
+    const CELL = 320;
+    for (let bi = 0; bi < this.buildings.length; bi++) {
+      const b = this.buildings[bi];
+      const x0 = Math.floor(b.x / CELL);
+      const x1 = Math.floor((b.x + b.w) / CELL);
+      const y0 = Math.floor(b.y / CELL);
+      const y1 = Math.floor((b.y + b.h) / CELL);
+      for (let cx = x0; cx <= x1; cx++) {
+        for (let cy = y0; cy <= y1; cy++) {
+          const k = cx + ',' + cy;
+          if (!this._grid.has(k)) this._grid.set(k, []);
+          this._grid.get(k).push(bi);
+        }
+      }
+    }
   }
 
   _windows(x, y, w, h, rng) {
@@ -162,8 +183,31 @@ export class World {
   }
 
   // Circle vs building rects: push the circle out, return true on hit.
+  // Only the buildings in the cells the circle overlaps are tested, in
+  // their original order, so the result matches a full scan.
   collideCircle(x, y, r) {
-    for (const b of this.buildings) {
+    const CELL = 320;
+    const x0 = Math.floor((x - r) / CELL);
+    const x1 = Math.floor((x + r) / CELL);
+    const y0 = Math.floor((y - r) / CELL);
+    const y1 = Math.floor((y + r) / CELL);
+    const seen = new Set();
+    const cands = [];
+    for (let cx = x0; cx <= x1; cx++) {
+      for (let cy = y0; cy <= y1; cy++) {
+        const list = this._grid.get(cx + ',' + cy);
+        if (!list) continue;
+        for (const bi of list) {
+          if (!seen.has(bi)) {
+            seen.add(bi);
+            cands.push(bi);
+          }
+        }
+      }
+    }
+    cands.sort((a, b) => a - b);
+    for (const bi of cands) {
+      const b = this.buildings[bi];
       const cx = Math.max(b.x, Math.min(x, b.x + b.w));
       const cy = Math.max(b.y, Math.min(y, b.y + b.h));
       const dx = x - cx;

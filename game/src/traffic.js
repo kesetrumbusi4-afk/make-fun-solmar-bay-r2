@@ -53,7 +53,8 @@ export class Traffic {
     };
   }
 
-  update(dt, world, player, fx) {
+  update(dt, world, player, fx, eco) {
+    this._frame = (this._frame || 0) + 1;
     // Traffic cars: keep lane, turn at intersections sometimes, avoid the player car ahead.
     for (const car of this.cars) {
       const step = car.speed * dt;
@@ -79,7 +80,9 @@ export class Traffic {
       // Slow down if something is right ahead.
       car.speed += (car.targetSpeed - car.speed) * dt;
     }
-    // Pedestrians: walk along sidewalks, pause and wander.
+    // Pedestrians: walk along sidewalks, pause and wander. In ECO mode
+    // they update every other frame — half the work, same streets.
+    if (eco && this._frame % 2 === 1) return;
     for (const p of this.peds) {
       p.phase += dt * 6;
       if (p.pause > 0) {
@@ -96,8 +99,9 @@ export class Traffic {
     }
   }
 
-  drawPeds(ctx) {
+  drawPeds(ctx, v) {
     for (const p of this.peds) {
+      if (v && (p.x < v.x0 || p.x > v.x1 || p.y < v.y0 || p.y > v.y1)) continue;
       ctx.save();
       ctx.translate(p.x, p.y);
       ctx.fillStyle = 'rgba(15, 6, 32, 0.45)';

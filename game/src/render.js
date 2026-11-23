@@ -17,11 +17,46 @@ export class Renderer {
     this.zoom = 0.95;
     this.dpr = 1;
     this.time = 0;
+    // Lamp halo, pre-rendered once: a radial gradient per lamp per frame is
+    // the single most expensive draw call in the scene, so each lamp now
+    // blits this sprite instead of building a gradient.
+    this._lampGlow = document.createElement('canvas');
+    this._lampGlow.width = 84;
+    this._lampGlow.height = 84;
+    const lg = this._lampGlow.getContext('2d');
+    const grad = lg.createRadialGradient(42, 42, 2, 42, 42, 42);
+    grad.addColorStop(0, 'rgba(255, 207, 110, 0.5)');
+    grad.addColorStop(1, 'rgba(255, 207, 110, 0)');
+    lg.fillStyle = grad;
+    lg.beginPath();
+    lg.arc(42, 42, 42, 0, Math.PI * 2);
+    lg.fill();
+    // Sunset wash, pre-rendered once per view size (rebuilt on resize).
+    this._duskCanvas = null;
+    this._duskW = 0;
+    this._duskH = 0;
   }
 
   resize(w, h) {
     this.viewW = w;
     this.viewH = h;
+  }
+
+  // World-space rectangle the camera can see, with a margin for shadows
+  // and markers. Everything below draws only inside it.
+  _view() {
+    const vw = this.viewW / this.zoom;
+    const vh = this.viewH / this.zoom;
+    return {
+      x0: this.camX - vw / 2 - 80,
+      y0: this.camY - vh / 2 - 80,
+      x1: this.camX + vw / 2 + 80,
+      y1: this.camY + vh / 2 + 80,
+    };
+  }
+
+  _inView(v, x, y, w, h) {
+    return x + w >= v.x0 && x <= v.x1 && y + h >= v.y0 && y <= v.y1;
   }
 
   _camTarget(game) {
@@ -47,27 +82,30 @@ export class Renderer {
     ctx.translate(this.viewW / 2, this.viewH / 2);
     ctx.scale(this.zoom, this.zoom);
     ctx.translate(-this.camX, -this.camY);
-    this._drawGround(ctx, game);
-    this._drawRoads(ctx, game);
-    this._drawParks(ctx, game);
-    this._drawBuildings(ctx, game);
-    this._drawLamps(ctx, game);
-    this._drawPackages(ctx, game);
-    this._drawParked(ctx, game);
-    game.traffic.cars.forEach((c) => c.draw(ctx));
-    game.traffic.drawPeds(ctx);
-    game.police.draw(ctx);
-    this._drawEnemies(ctx, game);
+    const v = this._view();
+    this._drawGround(ctx, game, v);
+    this._drawRoads(ctx, game, v);
+    this._drawParks(ctx, game, v);
+    this._drawBuildings(ctx, game, v);
+    this._drawLamps(ctx, game, v);
+    this._drawPackages(ctx, game, v);
+    this._drawParked(ctx, game, v);
+    for (const c of game.traffic.cars) {
+      if (this._inView(v, c.x - 30, c.y - 30, 60, 60)) c.draw(ctx);
+    }
+    game.traffic.drawPeds(ctx, v);
+    game.police.draw(ctx, v);
+    this._drawEnemies(ctx, game, v);
     if (p.car) p.car.draw(ctx);
     else p.draw(ctx);
-    this._drawFx(ctx, game);
+    this._drawFx(ctx, game, v);
     this._drawMarkers(ctx, game);
     this._drawDusk(ctx, game);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     this._drawHUD(ctx, game);
   }
 
-  _drawGround(ctx, game) {
+  _drawGround(ctx, game, v) {
     const w = game.world;
     ctx.fillStyle = PAL.ground;
     ctx.fillRect(0, 0, WORLD_W, WORLD_H);
@@ -77,7 +115,8 @@ export class Renderer {
     ctx.fillStyle = PAL.water;
     ctx.fillRect(w.waterX, 0, WORLD_W - w.waterX, WORLD_H);
     ctx.fillStyle = PAL.waterShine;
-    for (let y = 40; y < WORLD_H; y += 130) {
+    // Same shine rows as before (y = 40 + k*130), only the rows in view.
+    for (let y = Math.max(40, 40 + Math.ceil((v.y0 - 40) / 130) * 130); y < Math.min(WORLD_H, v.y1); y += 130) {
       ctx.fillRect(w.waterX + 30 + ((y * 7) % 120), y, 70, 3);
     }
     // Docks planks.
@@ -85,20 +124,27 @@ export class Renderer {
     ctx.fillRect(w.sandX + 20, w.docks.y - 60, 90, 120);
   }
 
-  _drawRoads(ctx, game) {
+  _drawRoads(ctx, game, v) {
     ctx.fillStyle = PAL.road;
     for (let i = 0; i < GRID_N; i++) {
       const c = roadCenter(i);
-      ctx.fillRect(c - ROAD_W / 2, 0, ROAD_W, WORLD_H);
-      ctx.fillRect(0, c - ROAD_W / 2, WORLD_W, ROAD_W);
+      if (c > v.x0 - ROAD_W && c < v.x1 + ROAD_W) ctx.fillRect(c - ROAD_W / 2, 0, ROAD_W, WORLD_H);
+      if (c > v.y0 - ROAD_W && c < v.y1 + ROAD_W) ctx.fillRect(0, c - ROAD_W / 2, WORLD_W, ROAD_W);
     }
-    // Center dashes + crosswalks.
+    // Center dashes + crosswalks, only where the camera looks.
+    // Same dash rows as before (d = 200 + k*64), only the rows in view.
     ctx.fillStyle = PAL.roadLine;
     for (let i = 0; i < GRID_N; i++) {
       const c = roadCenter(i);
-      for (let d = 200; d < WORLD_H; d += 64) {
-        ctx.fillRect(c - 2, d, 4, 26);
-        ctx.fillRect(d, c - 2, 26, 4);
+      if (c > v.x0 - ROAD_W && c < v.x1 + ROAD_W) {
+        for (let d = Math.max(200, 200 + Math.ceil((v.y0 - 200) / 64) * 64); d < Math.min(WORLD_H, v.y1); d += 64) {
+          ctx.fillRect(c - 2, d, 4, 26);
+        }
+      }
+      if (c > v.y0 - ROAD_W && c < v.y1 + ROAD_W) {
+        for (let d = Math.max(200, 200 + Math.ceil((v.x0 - 200) / 64) * 64); d < Math.min(WORLD_W, v.x1); d += 64) {
+          ctx.fillRect(d, c - 2, 26, 4);
+        }
       }
     }
     ctx.fillStyle = PAL.crosswalk;
@@ -106,6 +152,7 @@ export class Renderer {
       for (let j = 0; j < GRID_N; j++) {
         const cx = roadCenter(i);
         const cy = roadCenter(j);
+        if (cx < v.x0 - ROAD_W || cx > v.x1 + ROAD_W || cy < v.y0 - ROAD_W || cy > v.y1 + ROAD_W) continue;
         for (let k = -2; k <= 2; k++) {
           ctx.fillRect(cx - ROAD_W / 2 + 6 + k * 14, cy - ROAD_W / 2 - 8, 8, 6);
           ctx.fillRect(cx - ROAD_W / 2 + 6 + k * 14, cy + ROAD_W / 2 + 2, 8, 6);
@@ -114,14 +161,16 @@ export class Renderer {
     }
   }
 
-  _drawParks(ctx, game) {
+  _drawParks(ctx, game, v) {
     for (const park of game.world.parks) {
+      if (!this._inView(v, park.x, park.y, park.w, park.h)) continue;
       ctx.fillStyle = PAL.grass;
       ctx.beginPath();
       ctx.roundRect(park.x, park.y, park.w, park.h, 10);
       ctx.fill();
     }
     for (const tree of game.world.trees) {
+      if (!this._inView(v, tree.x - tree.r, tree.y - tree.r, tree.r * 2, tree.r * 2)) continue;
       ctx.fillStyle = 'rgba(15, 6, 32, 0.4)';
       ctx.beginPath();
       ctx.ellipse(tree.x + 5, tree.y + 6, tree.r, tree.r * 0.7, 0, 0, Math.PI * 2);
@@ -137,10 +186,11 @@ export class Renderer {
     }
   }
 
-  _drawBuildings(ctx, game) {
+  _drawBuildings(ctx, game, v) {
     for (const b of game.world.buildings) {
       // Long dusk shadow, cast to the north-east.
       const sh = b.height * 0.9;
+      if (b.x + b.w + sh < v.x0 || b.x > v.x1 || b.y + b.h < v.y0 || b.y > v.y1) continue;
       ctx.fillStyle = PAL.shadow;
       ctx.beginPath();
       ctx.moveTo(b.x + 8, b.y + b.h);
@@ -167,15 +217,11 @@ export class Renderer {
     }
   }
 
-  _drawLamps(ctx, game) {
+  _drawLamps(ctx, game, v) {
     for (const lamp of game.world.streetLamps) {
-      const g = ctx.createRadialGradient(lamp.x, lamp.y, 2, lamp.x, lamp.y, 42);
-      g.addColorStop(0, 'rgba(255, 207, 110, 0.5)');
-      g.addColorStop(1, 'rgba(255, 207, 110, 0)');
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.arc(lamp.x, lamp.y, 42, 0, Math.PI * 2);
-      ctx.fill();
+      if (lamp.x < v.x0 || lamp.x > v.x1 || lamp.y < v.y0 || lamp.y > v.y1) continue;
+      // Pre-rendered halo sprite; ECO mode draws only the lamp dot.
+      if (!game.perf.eco) ctx.drawImage(this._lampGlow, lamp.x - 42, lamp.y - 42);
       ctx.fillStyle = '#ffcf6e';
       ctx.beginPath();
       ctx.arc(lamp.x, lamp.y, 3, 0, Math.PI * 2);
@@ -183,9 +229,10 @@ export class Renderer {
     }
   }
 
-  _drawPackages(ctx, game) {
+  _drawPackages(ctx, game, v) {
     for (const pkg of game.world.packages) {
       if (pkg.taken) continue;
+      if (!this._inView(v, pkg.x - 18, pkg.y - 18, 36, 36)) continue;
       const pulse = 0.6 + 0.4 * Math.sin(this.time * 4 + pkg.id);
       ctx.fillStyle = `rgba(255, 215, 106, ${0.25 * pulse})`;
       ctx.beginPath();
@@ -198,8 +245,9 @@ export class Renderer {
     }
   }
 
-  _drawParked(ctx, game) {
+  _drawParked(ctx, game, v) {
     for (const pc of game.world.parkedCars) {
+      if (!this._inView(v, pc.x - 30, pc.y - 30, 60, 60)) continue;
       if (pc.car) {
         pc.car.draw(ctx);
         continue;
@@ -219,9 +267,10 @@ export class Renderer {
     }
   }
 
-  _drawEnemies(ctx, game) {
+  _drawEnemies(ctx, game, v) {
     for (const e of game.missions.enemies) {
       if (e.dead) continue;
+      if (!this._inView(v, e.x - 24, e.y - 24, 48, 48)) continue;
       ctx.save();
       ctx.translate(e.x, e.y);
       ctx.rotate(e.angle);
@@ -248,8 +297,9 @@ export class Renderer {
     }
   }
 
-  _drawFx(ctx, game) {
+  _drawFx(ctx, game, v) {
     for (const s of game.fx.skids) {
+      if (!this._inView(v, s.x - 16, s.y - 16, 32, 32)) continue;
       ctx.strokeStyle = `rgba(10, 6, 20, ${Math.min(0.5, s.life / 8)})`;
       ctx.lineWidth = 4;
       ctx.beginPath();
@@ -258,6 +308,7 @@ export class Renderer {
       ctx.stroke();
     }
     for (const pt of game.fx.parts) {
+      if (!this._inView(v, pt.x - 12, pt.y - 12, 24, 24)) continue;
       ctx.globalAlpha = Math.max(0, pt.life / pt.maxLife);
       ctx.fillStyle = pt.color;
       ctx.beginPath();
@@ -312,14 +363,27 @@ export class Renderer {
 
   _drawDusk(ctx, game) {
     // Warm sunset wash + vignette so the whole city reads as dusk.
+    // Pre-rendered once per view size instead of a fresh gradient each frame.
     const vw = this.viewW / this.zoom;
     const vh = this.viewH / this.zoom;
-    const g = ctx.createLinearGradient(this.camX - vw / 2, this.camY - vh / 2, this.camX - vw / 2, this.camY + vh / 2);
-    g.addColorStop(0, 'rgba(255, 120, 60, 0.05)');
-    g.addColorStop(0.6, 'rgba(120, 40, 120, 0.06)');
-    g.addColorStop(1, 'rgba(20, 8, 50, 0.14)');
-    ctx.fillStyle = g;
-    ctx.fillRect(this.camX - vw / 2, this.camY - vh / 2, vw, vh);
+    const w = Math.ceil(vw);
+    const h = Math.ceil(vh);
+    if (!this._duskCanvas || this._duskW !== w || this._duskH !== h) {
+      const c = document.createElement('canvas');
+      c.width = w;
+      c.height = h;
+      const dc = c.getContext('2d');
+      const g = dc.createLinearGradient(0, 0, 0, h);
+      g.addColorStop(0, 'rgba(255, 120, 60, 0.05)');
+      g.addColorStop(0.6, 'rgba(120, 40, 120, 0.06)');
+      g.addColorStop(1, 'rgba(20, 8, 50, 0.14)');
+      dc.fillStyle = g;
+      dc.fillRect(0, 0, w, h);
+      this._duskCanvas = c;
+      this._duskW = w;
+      this._duskH = h;
+    }
+    ctx.drawImage(this._duskCanvas, this.camX - vw / 2, this.camY - vh / 2, vw, vh);
   }
 
   _drawHUD(ctx, game) {
@@ -343,8 +407,7 @@ export class Renderer {
     ctx.fillText(`$${p.cash}`, 180, 52);
     ctx.fillStyle = '#c9b8e8';
     ctx.font = '12px system-ui, sans-serif';
-    const got = game.world.packages.filter((k) => k.taken).length;
-    ctx.fillText(`Packages ${got}/10`, 22, 68);
+    ctx.fillText(`Packages ${game.world.packagesTaken}/10`, 22, 68);
     // Top-center: objective / message.
     const st = game.missions.currentStage;
     const msg = game.missions.messageTimer > 0 ? game.missions.message : st ? st.text : game.missions.active ? game.missions.active.title : 'Free roam — find Lena at the bar (M)';
@@ -370,6 +433,12 @@ export class Renderer {
       ctx.fillStyle = i < game.police.stars ? '#ffd76a' : 'rgba(255,255,255,0.25)';
       ctx.font = '18px system-ui, sans-serif';
       ctx.fillText('★', vw - 186 + i * 24, 46);
+    }
+    // ECO badge while adaptive quality is holding the frame rate.
+    if (game.perf.eco) {
+      ctx.fillStyle = '#7ae0a3';
+      ctx.font = 'bold 11px system-ui, sans-serif';
+      ctx.fillText('ECO · performance mode', vw - 186, 68);
     }
     // Bottom-left: speed / ammo / controls.
     ctx.fillStyle = 'rgba(12, 6, 26, 0.78)';
